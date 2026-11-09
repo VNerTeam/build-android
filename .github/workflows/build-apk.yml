@@ -1,0 +1,120 @@
+name: Build APK
+
+# Cách chạy:
+#  1) Đẩy tag:   git tag v1.0.0 && git push origin v1.0.0
+#  2) Hoặc vào tab Actions > "Build APK" > Run workflow, nhập phiên bản (vd 1.0.0)
+# Kết quả: file LightPlayer-<phiên bản>.apk được đính vào GitHub Release cùng tên tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Phiên bản (vd 1.0.0). Tag sẽ là v + phiên bản'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xác định phiên bản
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${{ inputs.version }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Chuẩn bị keystore ký APK
+        id: ks
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ks"
+          KS="$RUNNER_TEMP/ks/release.jks"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Chưa cấu hình secrets KEYSTORE_*. Tạo keystore tạm: mỗi bản build sẽ có chữ ký KHÁC NHAU, cập nhật đè lên bản cũ sẽ báo lỗi (phải gỡ bản cũ). Xem README để cấu hình."
+            KEYSTORE_PASSWORD="$(openssl rand -hex 12)"
+            echo "::add-mask::$KEYSTORE_PASSWORD"
+            KEY_PASSWORD="$KEYSTORE_PASSWORD"
+            KEY_ALIAS="lightplayer"
+            keytool -genkeypair -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=LightPlayer"
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "KEYSTORE_FILE=$KS"
+            echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Build APK
+        run: >
+          gradle assembleRelease --no-daemon --stacktrace
+          -PversionName=${{ steps.ver.outputs.version }}
+          -PversionCode=${{ github.run_number }}
+
+      - name: Đổi tên APK và kiểm tra chữ ký
+        id: apk
+        run: |
+          APK="LightPlayer-${{ steps.ver.outputs.version }}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$APK"
+          echo "file=$APK" >> "$GITHUB_OUTPUT"
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          "$APKSIGNER" verify --print-certs "$APK" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LightPlayer-apk
+          path: ${{ steps.apk.outputs.file }}
+
+      - name: Đưa APK lên Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.version }}
+          APK: ${{ steps.apk.outputs.file }}
+          STABLE: ${{ steps.ks.outputs.stable }}
+        run: |
+          {
+            echo "## LightPlayer $VER (Android)"
+            echo
+            echo "Tải **$APK** về điện thoại, mở file và cho phép cài từ nguồn không rõ nếu được hỏi."
+            echo
+            echo "- Lần đầu mở app: cấp quyền *Truy cập tất cả tệp* để dùng thư mục video riêng \`/LightPlayer\`."
+            echo "- Video nằm ngoài dữ liệu app nên gỡ app không bị mất."
+            if [ "$STABLE" != "true" ]; then
+              echo
+              echo "> ⚠️ Bản này ký bằng keystore tạm. Nếu đã cài bản trước, hãy gỡ bản cũ rồi cài lại (video trong \`/LightPlayer\` không bị ảnh hưởng)."
+            fi
+          } > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" --title "LightPlayer $VER" --notes-file notes.md --target "$GITHUB_SHA"
+          fi
