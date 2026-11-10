@@ -40,6 +40,9 @@ import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.exoplayer.video.VideoRendererEventListener
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.TimeBar
 import java.io.File
@@ -60,6 +63,9 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var detector: GestureDetector
 
     private var items: List<VideoItem> = emptyList()
+    private var viewUriArg: Uri? = null
+    // true = uu tien bo giai ma PHAN MEM (dung khi decoder phan cung bao DECODING_FAILED)
+    private var softMode = false
     private val handler = Handler(Looper.getMainLooper())
 
     // cu chi
@@ -260,7 +266,8 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun setupPlayer(viewUri: Uri?, startIndex: Int, startMs: Long) {
-        val p = ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true)).build()
+        viewUriArg = viewUri
+        val p = ExoPlayer.Builder(this, SoftFirstFactory(this, softMode)).build()
         exo = p
         p.setAudioAttributes(
             AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),
@@ -300,7 +307,30 @@ class PlayerActivity : AppCompatActivity() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                Toast.makeText(this@PlayerActivity, "Không phát được: " + error.errorCodeName, Toast.LENGTH_LONG).show()
+                // Decoder phan cung loi (vd HEVC) -> thu lai bang decoder phan mem, giu nguyen vi tri
+                val retry = error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+                val cur = exo
+                if (retry && !softMode && cur != null) {
+                    softMode = true
+                    val i = cur.currentMediaItemIndex
+                    val at = maxOf(cur.currentPosition, 1L)
+                    Toast.makeText(this@PlayerActivity, "Decoder phần cứng lỗi, thử giải mã phần mềm…", Toast.LENGTH_SHORT).show()
+                    handler.post {
+                        exo?.release()
+                        exo = null
+                        setupPlayer(viewUriArg, i, at)
+                    }
+                    return
+                }
+                val cause = error.cause
+                Toast.makeText(
+                    this@PlayerActivity,
+                    "Không phát được: " + error.errorCodeName +
+                        (if (cause != null) "\n" + cause.javaClass.simpleName + ": " + cause.message else ""),
+                    Toast.LENGTH_LONG
+                ).show()
                 val pl = exo
                 if (pl != null && pl.hasNextMediaItem()) {
                     pl.seekToNextMediaItem()
@@ -516,5 +546,31 @@ class PlayerActivity : AppCompatActivity() {
         val s = Bitmap.createScaledBitmap(f, 320, f.height * 320 / f.width, true)
         if (s !== f) f.recycle()
         return s
+    }
+
+    /** Che do phan mem: dua decoder phan mem (OMX.google / c2.android) len dau danh sach decoder cua video. */
+    private class SoftFirstFactory(ctx: Context, private val soft: Boolean) : DefaultRenderersFactory(ctx) {
+        init {
+            setEnableDecoderFallback(true)
+        }
+
+        override fun buildVideoRenderers(
+            context: Context,
+            extensionRendererMode: Int,
+            mediaCodecSelector: MediaCodecSelector,
+            enableDecoderFallback: Boolean,
+            eventHandler: Handler,
+            eventListener: VideoRendererEventListener,
+            allowedVideoJoiningTimeMs: Long,
+            out: ArrayList<Renderer>
+        ) {
+            val sel = if (!soft) mediaCodecSelector else MediaCodecSelector { mime, secure, tunneling ->
+                mediaCodecSelector.getDecoderInfos(mime, secure, tunneling).sortedBy { if (it.softwareOnly) 0 else 1 }
+            }
+            super.buildVideoRenderers(
+                context, extensionRendererMode, sel, enableDecoderFallback,
+                eventHandler, eventListener, allowedVideoJoiningTimeMs, out
+            )
+        }
     }
 }
